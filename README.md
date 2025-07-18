@@ -37,7 +37,7 @@ pip install numpy pyaudio scipy
 ## Usage
 
 ```bash
-python v.py
+python ATuner.py
 ```
 
 - Select your input device (microphone) and buffer size
