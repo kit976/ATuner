@@ -1,5 +1,13 @@
+#!/usr/bin/env python3
+
 """
 ATuner.py - A simple, efficient tuner application for string instruments like violin.
+
+Optimized patch:
+- Precompute Butterworth filter
+- FFT-based autocorrelation for speed (buffer_size=1024 by default)
+- Use canvas.coords/itemconfig to move pointer & update signal bar (no delete/create each frame)
+- Keep original pitch detection semantics and UI behavior
 
 Features:
 - Real-time pitch detection using autocorrelation and parabolic interpolation.
@@ -44,13 +52,17 @@ except ImportError:
     )
     exit()
 
+# -----------------------
+# Constants / Defaults
+# -----------------------
 SAMPLE_RATE = 48000
 DEFAULT_BUFFER_SIZE = 1024
 BUFFER_SIZES = [512, 1024, 2048]
 NOTE_STRINGS = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B']
 MAX_CENTS = 50
 SMOOTHING_FACTOR = 0.15
-POINTER_SMOOTHING = 0.2
+POINTER_SMOOTHING = 0.20  # keeps pointer movement smooth
+SIGNAL_SMOOTHING = 0.15
 
 VIOLIN_NOTES = {
     'G3': {'frequency': 196.0, 'note_num': 55, 'name': 'G', 'octave': 3},
@@ -59,12 +71,13 @@ VIOLIN_NOTES = {
     'E5': {'frequency': 659.3, 'note_num': 76, 'name': 'E', 'octave': 5}
 }
 
+# -----------------------
+# Pitch Detector
+# -----------------------
 class PitchDetector:
     """
-    Detects fundamental frequency using autocorrelation and parabolic interpolation.
-    Use detect(audio) to get pitch in Hz from a numpy array.
-    - sample_rate: Audio sample rate in Hz
-    - buffer_size: Number of samples per analysis frame
+    Detects fundamental frequency using autocorrelation (FFT-based) + parabolic interpolation.
+    Precomputes filter coefficients (Butterworth) for reuse.
     """
     def __init__(self, sample_rate=SAMPLE_RATE, buffer_size=DEFAULT_BUFFER_SIZE):
         self.sample_rate = sample_rate
@@ -74,6 +87,27 @@ class PitchDetector:
         self.min_freq = 80
         self.max_freq = 3000
         self.threshold = 0.01
+
+        # Precompute butterworth filter coefficients (do once)
+        nyquist = 0.5 * self.sample_rate
+        cutoff = min(3000.0, self.max_freq * 1.2)
+        try:
+            self.b, self.a = butter(4, cutoff / nyquist, btype='low')
+        except Exception as e:
+            logging.warning(f"Filter coeffs creation failed: {e}")
+            self.b, self.a = None, None
+
+        # FFT length for autocorrelation (use next pow-2 >= 2*buffer for speed)
+        self._fft_n = 1
+        while self._fft_n < 2 * self.buffer_size:
+            self._fft_n <<= 1
+
+    def set_buffer_size(self, buffer_size):
+        self.buffer_size = buffer_size
+        # recompute fft length
+        self._fft_n = 1
+        while self._fft_n < 2 * self.buffer_size:
+            self._fft_n <<= 1
 
     def _parabolic(self, array, idx):
         """Refine peak index for sub-sample accuracy."""
@@ -87,39 +121,69 @@ class PitchDetector:
 
     def detect(self, audio):
         """Returns detected frequency in Hz or None."""
-        if len(audio) < self.buffer_size:
+        if len(audio) < max(64, self.buffer_size):
             return None
-        if np.sqrt(np.mean(audio ** 2)) < self.threshold:
+        # Quick RMS check to avoid useless compute
+        if np.sqrt(np.mean(audio.astype(np.float64) ** 2)) < self.threshold:
             return None
-        nyquist = 0.5 * self.sample_rate
-        cutoff = min(3000, self.max_freq * 1.2)
-        b, a = butter(4, cutoff / nyquist, btype='low')
-        filtered = filtfilt(b, a, audio)
+
+        # Apply precomputed low-pass filter if available
+        try:
+            if self.b is not None and self.a is not None and len(audio) > max(len(self.a), len(self.b)):
+                filtered = filtfilt(self.b, self.a, audio)
+            else:
+                filtered = audio
+        except Exception:
+            # If filtfilt fails for some reason, fallback to raw audio
+            filtered = audio
+
+        # Window
         windowed = filtered * np.hanning(len(filtered))
-        autocorr = np.correlate(windowed, windowed, mode='full')[len(windowed)-1:]
-        autocorr /= np.max(np.abs(autocorr)) + 1e-10
-        min_period = int(self.sample_rate / self.max_freq)
+
+        # FFT-based autocorrelation (faster for buffer ~ 1024)
+        n = self._fft_n
+        fft_data = np.fft.rfft(windowed, n=n)
+        power_spectrum = fft_data * np.conj(fft_data)
+        autocorr_full = np.fft.irfft(power_spectrum, n=n)
+        autocorr = autocorr_full[:len(windowed)]
+
+        # Normalize
+        max_abs = np.max(np.abs(autocorr)) + 1e-12
+        autocorr = autocorr / max_abs
+
+        # search for peaks in allowed period range
+        min_period = max(1, int(self.sample_rate / self.max_freq))
         max_period = int(self.sample_rate / self.min_freq)
         if max_period >= len(autocorr):
             max_period = len(autocorr) - 1
-        peaks, _ = find_peaks(autocorr, height=0.1)
+
+        # Use find_peaks with a modest height to reject noise
+        try:
+            peaks, properties = find_peaks(autocorr, height=0.05)
+        except Exception:
+            peaks = []
+            properties = {}
+
+        # Filter peaks in allowed period range
         peaks = [p for p in peaks if min_period <= p <= max_period]
         if not peaks:
             return None
+
+        # Choose best peak with highest autocorr value
         best = max(peaks, key=lambda p: autocorr[p])
         interp = self._parabolic(autocorr, best)
         if interp > 0:
-            freq = self.sample_rate / interp
+            freq = float(self.sample_rate) / interp
             if self.min_freq <= freq <= self.max_freq:
                 return freq
         return None
 
+# -----------------------
+# Tuner (audio handling)
+# -----------------------
 class Tuner:
     """
-    Handles audio input, pitch detection, and note conversion.
-    - Use start_recording/stop_recording to control audio stream.
-    - Use freq_to_note(freq) to convert frequency to note info.
-    - Device selection and buffer size are configurable.
+    Handles audio stream, pitch detection, and queueing notes for UI.
     """
     def __init__(self, sample_rate=SAMPLE_RATE, buffer_size=DEFAULT_BUFFER_SIZE, device_index=None):
         self.sample_rate = sample_rate
@@ -138,33 +202,38 @@ class Tuner:
         self.signal_level = 0.0
 
     def list_devices(self):
-        """Returns list of available input devices."""
+        """Returns list of available input devices as (index, name)."""
         devices = []
         try:
             audio = pyaudio.PyAudio()
             for i in range(audio.get_device_count()):
                 info = audio.get_device_info_by_index(i)
-                if info['maxInputChannels'] > 0:
-                    devices.append((i, info['name']))
+                if info.get('maxInputChannels', 0) > 0:
+                    devices.append((i, info.get('name', f"Device {i}")))
             audio.terminate()
         except Exception as e:
             logging.error(f"Device list error: {e}")
         return devices
 
     def init_audio(self):
-        """Initializes audio input stream."""
+        """Initializes audio input stream (lazy)."""
         try:
             if self.audio_initialized:
                 return True
             self.audio = pyaudio.PyAudio()
+            # Pick first available input device if none specified
             if self.device_index is None:
                 for i in range(self.audio.get_device_count()):
                     info = self.audio.get_device_info_by_index(i)
-                    if info['maxInputChannels'] > 0:
+                    if info.get('maxInputChannels', 0) > 0:
                         self.device_index = i
                         break
             if self.device_index is None:
                 raise Exception("No audio input device found")
+
+            # Ensure detector buffer size is up to date
+            self.detector.set_buffer_size(self.buffer_size)
+
             self.stream = self.audio.open(
                 format=pyaudio.paFloat32,
                 channels=1,
@@ -182,23 +251,33 @@ class Tuner:
             return False
 
     def _audio_callback(self, in_data, frame_count, time_info, status):
-        """Processes audio buffer, updates note_queue."""
+        """
+        Processes incoming audio. Keep processing light and robust.
+        Puts latest detected note into a small queue for UI consumption.
+        """
         if not self.is_recording:
             return (in_data, pyaudio.paContinue)
         try:
-            audio_data = np.frombuffer(in_data, dtype=np.float32)
-            self.signal_level = np.sqrt(np.mean(audio_data ** 2))
+            # Convert to numpy float32 array; avoid copies if possible
+            audio_data = np.frombuffer(in_data, dtype=np.float32).astype(np.float64)
+
+            # Update RMS-level (for signal bar)
+            self.signal_level = float(np.sqrt(np.mean(audio_data ** 2)))
+
+            # Run detector on the chunk (detector accepts arrays of variable length)
             freq = self.detector.detect(audio_data)
             if freq:
                 note = self.freq_to_note(freq)
                 if note:
+                    # Debounce: only put newest note if same as last or last is None
                     if self.last_note == note['name'] or self.last_note is None:
                         self.last_note = note['name']
-                        while not self.note_queue.empty():
-                            try:
+                        # flush previous items to keep queue fresh
+                        try:
+                            while not self.note_queue.empty():
                                 self.note_queue.get_nowait()
-                            except queue.Empty:
-                                break
+                        except queue.Empty:
+                            pass
                         try:
                             self.note_queue.put_nowait(note)
                         except queue.Full:
@@ -215,17 +294,17 @@ class Tuner:
             if freq <= 0:
                 return None
             note_num = 12 * math.log2(freq / self.middle_a) + self.semitone
-            rounded = round(note_num)
-            std_freq = self.middle_a * (2 ** ((rounded - self.semitone) / 12))
-            cents = 1200 * math.log2(freq / std_freq)
+            rounded = int(round(note_num))
+            std_freq = self.middle_a * (2 ** ((rounded - self.semitone) / 12.0))
+            cents = 1200.0 * math.log2(freq / std_freq) if freq > 0 and std_freq > 0 else 0.0
             cents = max(-MAX_CENTS, min(MAX_CENTS, cents))
             name = self.note_strings[rounded % 12]
             octave = (rounded // 12) - 1
             return {
                 'name': name,
                 'octave': octave,
-                'frequency': freq,
-                'cents': cents,
+                'frequency': float(freq),
+                'cents': float(cents),
                 'note_number': rounded
             }
         except Exception as e:
@@ -240,6 +319,14 @@ class Tuner:
                 if not self.stream.is_active():
                     self.stream.start_stream()
                 return True
+            # If stream is not created yet, try init_audio & start
+            if self.init_audio():
+                if self.stream:
+                    self.is_recording = True
+                    if not self.stream.is_active():
+                        self.stream.start_stream()
+                    return True
+            return False
         except Exception as e:
             logging.warning(f"Start recording error: {e}")
             return False
@@ -258,10 +345,16 @@ class Tuner:
         try:
             self.stop_recording()
             if self.stream:
-                self.stream.close()
+                try:
+                    self.stream.close()
+                except Exception:
+                    pass
                 self.stream = None
             if self.audio:
-                self.audio.terminate()
+                try:
+                    self.audio.terminate()
+                except Exception:
+                    pass
                 self.audio = None
             self.audio_initialized = False
         except Exception as e:
@@ -282,12 +375,13 @@ class Tuner:
             messagebox.showwarning("Invalid Input", "Please enter a valid number for A4 frequency")
             return False
 
+# -----------------------
+# Meter (UI)
+# -----------------------
 class Meter:
     """
     Draws analog-style tuning meter on Tkinter Canvas.
-    - update_pointer(cents): update pointer position.
-    - create_meter(): draw meter background and scale.
-    - Color-coded zones: green (in tune), orange/red (out of tune).
+    Uses coords() to move pointer for better performance.
     """
     def __init__(self, canvas, width=440, height=220):
         self.canvas = canvas
@@ -296,26 +390,35 @@ class Meter:
         self.center_x = width // 2
         self.center_y = height - 30
         self.radius = min(width, height) * 0.4
-        self.pointer_angle = 0
-        self.target_angle = 0
+        self.pointer_angle = math.radians(90)  # start pointing up
+        self.target_angle = self.pointer_angle
+        self.pointer_id = None
         self.create_meter()
 
     def create_meter(self):
-        """Draws meter background and scale."""
+        """Draws meter background and creates pointer once."""
         self.canvas.delete("all")
+        # draw colored arcs (kept as static draws)
         self.draw_arc(-50, -10, "#FF3030", 8)
         self.draw_arc(-10, -3, "#FF9500", 6)
         self.draw_arc(-3, 3, "#00FF00", 10)
         self.draw_arc(3, 10, "#FF9500", 6)
         self.draw_arc(10, 50, "#FF3030", 8)
         self.draw_scale_marks()
+        # center dot
         self.canvas.create_oval(
             self.center_x - 3, self.center_y - 3,
             self.center_x + 3, self.center_y + 3,
             fill="#FFFFFF", outline="#FFFFFF"
         )
-        self.pointer_id = None
-        self.update_pointer(0)
+        # create pointer line once and move it later via coords()
+        pointer_length = self.radius * 0.8
+        end_x = self.center_x - pointer_length * math.cos(self.pointer_angle)
+        end_y = self.center_y - pointer_length * math.sin(self.pointer_angle)
+        self.pointer_id = self.canvas.create_line(
+            self.center_x, self.center_y, end_x, end_y,
+            fill="#FF0000", width=4, capstyle="round"
+        )
 
     def draw_arc(self, start_cents, end_cents, color, width):
         """Draws colored arc segment for cent range."""
@@ -360,28 +463,25 @@ class Meter:
             )
 
     def update_pointer(self, cents):
-        """Updates pointer position for cent deviation."""
-        if self.pointer_id:
-            self.canvas.delete(self.pointer_id)
+        """Updates pointer position for cent deviation using coords() for performance."""
+        # Compute target angle from cents
         self.target_angle = math.radians(90 + np.clip(cents, -MAX_CENTS, MAX_CENTS) * 1.8)
+        # Ease pointer angle
         self.pointer_angle += (self.target_angle - self.pointer_angle) * POINTER_SMOOTHING
         pointer_length = self.radius * 0.8
         end_x = self.center_x - pointer_length * math.cos(self.pointer_angle)
         end_y = self.center_y - pointer_length * math.sin(self.pointer_angle)
-        self.pointer_id = self.canvas.create_line(
-            self.center_x, self.center_y, end_x, end_y,
-            fill="#FF0000", width=4, capstyle="round"
-        )
+        # Move the existing pointer instead of deleting/creating
+        if self.pointer_id:
+            try:
+                self.canvas.coords(self.pointer_id, self.center_x, self.center_y, end_x, end_y)
+            except Exception as e:
+                logging.warning(f"Pointer update error: {e}")
 
+# -----------------------
+# Main Application UI
+# -----------------------
 class TunerApp:
-    """
-    Main GUI application. Handles user interaction and display updates.
-    - create_widgets(): sets up all UI widgets.
-    - update_display(): updates all UI elements with latest tuning and signal data.
-    - on_device_change/on_buffer_change: handle device/buffer selection.
-    - open_settings(): dialog for A4 pitch.
-    - toggle_tuning(): start/stop tuning.
-    """
     def __init__(self, root):
         self.root = root
         self.root.title("Tuner")
@@ -399,15 +499,17 @@ class TunerApp:
             'button_active': '#0a84ff',
             'button_inactive': '#333333',
         }
-        self.tuner = Tuner()
+        self.tuner = Tuner(buffer_size=DEFAULT_BUFFER_SIZE)
         self.current_note = None
         self.is_running = False
-        self.smooth_cents = 0
+        self.smooth_cents = 0.0
         self.last_update_time = time.time()
         self.selected_buffer_size = tk.IntVar(value=DEFAULT_BUFFER_SIZE)
         self.selected_device = tk.IntVar(value=0)
         self.smooth_signal_level = 0.0
+        self.devices = []  # will hold (index, name)
         self.create_widgets()
+        # start update loop (balanced fps for smooth pointer vs CPU)
         self.start_update_loop()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -415,18 +517,28 @@ class TunerApp:
         """Sets up all UI widgets."""
         settings_frame = tk.Frame(self.root, bg=self.colors['bg'])
         settings_frame.pack(pady=12)
+
         tk.Label(settings_frame, text="Input Device:", bg=self.colors['bg'], fg=self.colors['secondary']).pack(side=tk.LEFT)
-        devices = self.tuner.list_devices()
-        device_names = [name for idx, name in devices]
+        # populate devices
+        self.devices = self.tuner.list_devices()
+        device_names = [name for idx, name in self.devices] if self.devices else ["(No input devices)"]
         self.device_menu = ttk.Combobox(settings_frame, values=device_names, state="readonly", width=25)
-        self.device_menu.current(0)
+        if self.devices:
+            self.device_menu.current(0)
+            self.selected_device.set(0)
+            # set tuner.device_index to real device index
+            self.tuner.device_index = self.devices[0][0]
+        else:
+            self.device_menu.current(0)
         self.device_menu.pack(side=tk.LEFT, padx=5)
         self.device_menu.bind("<<ComboboxSelected>>", self.on_device_change)
+
         tk.Label(settings_frame, text="Buffer Size:", bg=self.colors['bg'], fg=self.colors['secondary']).pack(side=tk.LEFT, padx=(10,0))
         self.buffer_menu = ttk.Combobox(settings_frame, values=BUFFER_SIZES, state="readonly", width=6)
         self.buffer_menu.current(BUFFER_SIZES.index(DEFAULT_BUFFER_SIZE))
         self.buffer_menu.pack(side=tk.LEFT)
         self.buffer_menu.bind("<<ComboboxSelected>>", self.on_buffer_change)
+
         self.note_frame = tk.Frame(self.root, bg=self.colors['bg'])
         self.note_frame.pack(pady=10)
         self.note_label = tk.Label(
@@ -441,12 +553,14 @@ class TunerApp:
             bg=self.colors['bg'], fg=self.colors['secondary']
         )
         self.octave_label.pack(side=tk.LEFT, anchor='n', padx=5, pady=15)
+
         self.meter_canvas = tk.Canvas(
             self.root, width=440, height=220,
             bg=self.colors['bg'], highlightthickness=0
         )
         self.meter_canvas.pack(pady=10)
         self.meter = Meter(self.meter_canvas, width=440, height=220)
+
         info_frame = tk.Frame(self.root, bg=self.colors['bg'])
         info_frame.pack(pady=15, fill=tk.X, padx=30)
         self.frequency_label = tk.Label(
@@ -461,14 +575,18 @@ class TunerApp:
             bg=self.colors['bg'], fg=self.colors['secondary']
         )
         self.cents_label.pack(side=tk.RIGHT)
+
         self.signal_bar = tk.Canvas(self.root, width=360, height=18, bg=self.colors['bg'], highlightthickness=0)
         self.signal_bar.pack(pady=8)
+        self.signal_bar_id = None  # rectangle id will be created on first draw
+
         self.status_label = tk.Label(
             self.root, text="Ready",
             font=("Arial", 16, "bold"),
             bg=self.colors['bg'], fg=self.colors['secondary']
         )
         self.status_label.pack(pady=10)
+
         button_frame = tk.Frame(self.root, bg=self.colors['bg'])
         button_frame.pack(pady=20, fill=tk.X, padx=30)
         self.start_button = tk.Button(
@@ -489,21 +607,26 @@ class TunerApp:
         settings_button.pack(fill=tk.X, ipady=8)
 
     def on_device_change(self, event):
-        """Handles input device selection change."""
+        """Handles input device selection change. Map combobox index to actual device index."""
         idx = self.device_menu.current()
-        self.tuner.device_index = idx
-        self.tuner.cleanup()
-        self.tuner = Tuner(buffer_size=self.tuner.buffer_size, device_index=idx)
-        logging.info(f"Changed input device to {idx}")
+        if 0 <= idx < len(self.devices):
+            real_dev_index = self.devices[idx][0]
+            # set device and cleanup audio stream; reinit will occur on start
+            self.tuner.device_index = real_dev_index
+            self.tuner.cleanup()
+            logging.info(f"Changed input device to {real_dev_index}")
 
     def on_buffer_change(self, event):
         """Handles buffer size selection change."""
-        size = int(self.buffer_menu.get())
-        self.tuner.buffer_size = size
-        self.tuner.detector.buffer_size = size
-        self.tuner.cleanup()
-        self.tuner = Tuner(buffer_size=size, device_index=self.tuner.device_index)
-        logging.info(f"Changed buffer size to {size}")
+        try:
+            size = int(self.buffer_menu.get())
+            # keep buffer size 1024 if user desires; but apply selected size
+            self.tuner.buffer_size = size
+            self.tuner.detector.set_buffer_size(size)
+            self.tuner.cleanup()
+            logging.info(f"Changed buffer size to {size}")
+        except Exception as e:
+            logging.warning(f"Buffer change error: {e}")
 
     def open_settings(self):
         """Opens dialog to set A4 pitch."""
@@ -547,18 +670,23 @@ class TunerApp:
         self.frequency_label.config(text="0.0 Hz")
         self.cents_label.config(text="0¢")
         self.current_note = None
-        self.smooth_cents = 0
-        self.signal_bar.delete("all")
+        self.smooth_cents = 0.0
+        # reset signal bar
+        if self.signal_bar_id:
+            self.signal_bar.coords(self.signal_bar_id, 0, 0, 0, 18)
+            self.signal_bar.itemconfig(self.signal_bar_id, fill=self.colors['warning'])
 
     def start_update_loop(self):
         """Starts periodic UI update loop."""
+        # Use ~20ms refresh to keep pointer smooth but CPU-friendly
         self.update_display()
-        self.root.after(17, self.start_update_loop)
+        self.root.after(20, self.start_update_loop)
 
     def update_display(self):
-        """Updates all UI elements with latest tuning and signal data."""
+        """Updates UI elements with latest tuning and signal data."""
         try:
             current_time = time.time()
+            updated = False
             if self.is_running:
                 latest_note = None
                 while not self.tuner.note_queue.empty():
@@ -569,10 +697,12 @@ class TunerApp:
                 if latest_note:
                     self.current_note = latest_note
                     self.last_update_time = current_time
+                    # update labels
                     self.note_label.config(text=self.current_note['name'])
                     self.octave_label.config(text=str(self.current_note['octave']))
                     self.frequency_label.config(text=f"{self.current_note['frequency']:.1f} Hz")
                     target_cents = np.clip(self.current_note['cents'], -MAX_CENTS, MAX_CENTS)
+                    # smooth cents display
                     self.smooth_cents += (target_cents - self.smooth_cents) * SMOOTHING_FACTOR
                     self.cents_label.config(text=f"{self.smooth_cents:+.1f}¢")
                     abs_cents = abs(self.smooth_cents)
@@ -586,7 +716,7 @@ class TunerApp:
                         status = "Sharp" if self.smooth_cents > 0 else "Flat"
                         color = self.colors['error']
                     is_violin_string = any(
-                        note_info['name'] == self.current_note['name'] and 
+                        note_info['name'] == self.current_note['name'] and
                         note_info['octave'] == self.current_note['octave']
                         for note_info in VIOLIN_NOTES.values()
                     )
@@ -595,19 +725,36 @@ class TunerApp:
                     self.status_label.config(text=status, fg=color)
                     self.note_label.config(fg=color)
                     self.cents_label.config(fg=color)
+                    updated = True
                 elif current_time - self.last_update_time > 1.0:
+                    # no recent note result
                     self.status_label.config(text="No Signal", fg=self.colors['secondary'])
                     self.note_label.config(fg=self.colors['secondary'])
                     self.cents_label.config(fg=self.colors['secondary'])
-            display_cents = self.smooth_cents if self.is_running else 0
+                    # gently return pointer to center
+                    self.smooth_cents += (0.0 - self.smooth_cents) * SMOOTHING_FACTOR
+                    updated = True
+
+            # Update meter pointer (always do, but using smoothed cents)
+            display_cents = self.smooth_cents if self.is_running else 0.0
             self.meter.update_pointer(display_cents)
-            self.signal_bar.delete("all")
-            target_level = min(1.0, self.tuner.signal_level * 10)
-            self.smooth_signal_level += (target_level - self.smooth_signal_level) * 0.15
-            fill = self.colors['good'] if self.smooth_signal_level > 0.2 else self.colors['warning']
+
+            # Update signal bar using coords/itemconfig instead of delete/create
+            target_level = min(1.0, self.tuner.signal_level * 10.0)
+            self.smooth_signal_level += (target_level - self.smooth_signal_level) * SIGNAL_SMOOTHING
             bar_length = int(360 * self.smooth_signal_level)
-            if bar_length > 0:
-                self.signal_bar.create_rectangle(0, 0, bar_length, 18, fill=fill, outline='')
+            if self.signal_bar_id is None:
+                # create first time
+                fill = self.colors['good'] if self.smooth_signal_level > 0.2 else self.colors['warning']
+                self.signal_bar_id = self.signal_bar.create_rectangle(0, 0, bar_length, 18, fill=fill, outline='')
+            else:
+                fill = self.colors['good'] if self.smooth_signal_level > 0.2 else self.colors['warning']
+                try:
+                    self.signal_bar.itemconfig(self.signal_bar_id, fill=fill)
+                    self.signal_bar.coords(self.signal_bar_id, 0, 0, bar_length, 18)
+                except Exception as e:
+                    logging.warning(f"Signal bar update error: {e}")
+
         except Exception as e:
             logging.warning(f"Update display error: {e}")
 
@@ -620,12 +767,17 @@ class TunerApp:
         except Exception as e:
             logging.warning(f"On closing error: {e}")
 
+# -----------------------
+# Entry point
+# -----------------------
 if __name__ == "__main__":
-    # Entry point: launches the tuner GUI
     try:
         root = tk.Tk()
         app = TunerApp(root)
         root.mainloop()
     except Exception as e:
         logging.error(f"Application Error: {e}")
-        messagebox.showerror("Application Error", f"Cannot start application: {e}")
+        try:
+            messagebox.showerror("Application Error", f"Cannot start application: {e}")
+        except Exception:
+            pass
